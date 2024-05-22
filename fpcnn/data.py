@@ -12,9 +12,12 @@ from functools import reduce, lru_cache
 
 import numpy as np
 import fplib
-from pymatgen.core.structure import Structure
-# from pymatgen.io.ase import AseAtomsAdaptor
 from ase.io import read as ase_read
+from ase.neighborlist import NeighborList
+#from pymatgen.io.ase import AseAtomsAdaptor
+from pymatgen.core.structure import Structure
+from pymatgen.analysis.molecule_structure_comparator import CovalentRadius
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
@@ -204,49 +207,90 @@ def collate_pool(dataset_list):
         torch.stack(batch_target, dim=0),\
         batch_struct_ids
 
-class GaussianDistance(object):
-    """
-    Expands the distance by Gaussian basis.
+def kron_delta(i, j):
+    if i == j:
+        m = 1.0
+    else:
+        m = 0.0
+    return m
 
-    Unit: angstrom
-    """
-    def __init__(self, dmin, dmax, step, var=None):
-        """
-        Parameters
-        ----------
+def get_gom(r_disp, dist, rcov, lmax=0):
 
-        dmin: float
-          Minimum interatomic distance
-        dmax: float
-          Maximum interatomic distance
-        step: float
-          Step size for the Gaussian filter
-        """
-        assert dmin < dmax
-        assert dmax - dmin > step
-        self.filter = np.arange(dmin, dmax+step, step)
-        if var is None:
-            var = min(2.0*step, (dmax-dmin)/3.0)
-        self.var = var
+    if lmax == 0:
+        lseg = 1
+    else:
+        lseg = 4
 
-    def expand(self, distances):
-        """
-        Apply Gaussian disntance filter to a numpy distance array
+    NC = 2
 
-        Parameters
-        ----------
+    assert (len(r_disp) == len(dist) and len(dist) == len(rcov)), \
+    "Your r_disp_list length is different from rcov_list length!"
+    nat, n_nbr = rcov.shape
+    om = np.empty((nat, n_nbr-1, lseg*lseg), dtype = np.float64)
+    mamp = np.empty((nat, n_nbr-1, lseg*lseg), dtype = np.float64)
+    if lseg == 1:
+        # s orbital only lseg == 1
+        for iat in range(nat):
+            cutoff = np.max(dist[iat])
+            wc = cutoff / np.sqrt(2.* NC)
+            fc = 1.0 / (2.0 * NC * wc**2)
+            for jat in range(n_nbr-1):
+                d = r_disp[iat][jat+1]
+                d2 = np.vdot(d, d)
+                assert np.allclose(np.sqrt(d2), dist[iat][jat+1])
+                t1 = ( 0.5 / rcov[iat][0]**2 ) * ( 0.5 / rcov[iat][jat+1]**2 )
+                t2 = ( 0.5 / rcov[iat][0]**2 ) + ( 0.5 / rcov[iat][jat+1]**2 )
+                om[iat][jat][0] = np.sqrt(2.0*np.sqrt(t1)/t2)**3 * np.exp(-t1/t2*d2)
+                mamp[iat][jat][0]=(1.0-d2*fc)**NC
+    else:
+        # for both s and p orbitals
+        for iat in range(nat):
+            cutoff = np.max(dist[iat])
+            wc = cutoff / np.sqrt(2.* NC)
+            fc = 1.0 / (2.0 * NC * wc**2)
+            for jat in range(n_nbr-1):
+                tmp_om = np.empty((lseg, lseg), dtype = np.float64)
 
-        distance: np.array shape n-d array
-          A distance matrix of any shape
+                d = r_disp[iat][jat+1]
+                d2 = np.vdot(d, d)
+                assert np.allclose(np.sqrt(d2), dist[iat][jat+1])
+                t1 = ( 0.5 / rcov[iat][0]**2 ) * ( 0.5 / rcov[iat][jat+1]**2 )
+                t2 = ( 0.5 / rcov[iat][0]**2 ) + ( 0.5 / rcov[iat][jat+1]**2 )
+                tmp_mamp = (1.0-d2*fc)**NC * np.ones((lseg, lseg), dtype = np.float64)
 
-        Returns
-        -------
-        expanded_distance: shape (n+1)-d array
-          Expanded distance matrix with the last dimension of length
-          len(self.filter)
-        """
-        return np.exp(-(distances[..., np.newaxis] - self.filter)**2 /
-                      self.var**2)
+                # <s_i | s_j>
+                sij = np.sqrt(2.0*np.sqrt(t1)/t2)**3 * np.exp(-t1/t2*d2)
+                tmp_om[0][0] = np.sqrt(2.0*np.sqrt(t1)/t2)**3 * np.exp(-t1/t2*d2)
+
+                # <s_i | p_j>
+                stv = 2.0 * (1/np.sqrt(0.5 / rcov[iat][jat+1]**2)) * (t1/t2) * sij
+                tmp_om[0][1] = stv * d[0]
+                tmp_om[0][2] = stv * d[1]
+                tmp_om[0][3] = stv * d[2]
+
+                # <p_i | s_j>
+                stv = -2.0 * (1/np.sqrt(0.5 / rcov[iat][0]**2)) * (t1/t2) * sij
+                tmp_om[1][0] = stv * d[0]
+                tmp_om[2][0] = stv * d[1]
+                tmp_om[3][0] = stv * d[2]
+
+                # <p_i | p_j>
+                stv = 2.0 * np.sqrt(t1)/t2 * sij
+                sx = -2.0*t1/t2
+
+                for i_pp in range(3):
+                    for j_pp in range(3):
+                        tmp_om[i_pp+1][j_pp+1] = stv * (sx * d[i_pp] * d[j_pp] + \
+                                                        kron_delta(i_pp, j_pp))
+
+                tmp_om_vec = tmp_om.ravel()
+                tmp_mamp_vec = tmp_om.ravel()
+
+                for k in range(lseg*lseg):
+                    om[iat][jat][k] = tmp_om_vec[k]
+                    mamp[iat][jat][k] = tmp_mamp_vec[k]
+
+    return om*mamp
 
 class StructData(Dataset):
     """
@@ -321,12 +365,10 @@ class StructData(Dataset):
             self.id_prop_data = [row for row in reader]
         random.seed(random_seed)
         random.shuffle(self.id_prop_data)
-
-        self.gdf = GaussianDistance(dmin=dmin, dmax=self.radius, step=step, var=var)
-
+        
     def __len__(self):
         return len(self.id_prop_data)
-
+    
     def read_types(self, cell_file):
         buff = []
         with open(cell_file) as f:
@@ -342,8 +384,7 @@ class StructData(Dataset):
             types += [i+1]*typt[i]
         types = np.array(types, int)
         return types
-
-    # @lru_cache(maxsize=None)
+    
     def get_fp_mat(self, cell_file):
         atoms = ase_read(cell_file)
         lat = atoms.cell[:]
@@ -394,73 +435,127 @@ class StructData(Dataset):
                                    log=False,
                                    orbital=orbital) # Long FP
         return fp
-
-    @lru_cache(maxsize=None)  # Cache loaded structures
-    def __getitem__(self, idx):
-
-        # if idx not in self.cache:
-
-        struct_id, target = self.id_prop_data[idx]
-        cell_file = os.path.join(self.root_dir, struct_id+'.vasp')
-        assert os.path.isfile(cell_file)
-
-        crystal = Structure.from_file(os.path.join(self.root_dir,
-                                                   struct_id+'.vasp'))
-
-        # Adaptor = AseAtomsAdaptor()
-        # atoms = Adaptor.get_atoms(crystal)
-
-        # One-hot encoding
+    
+    def get_atom_nbr_feature(self, cell_file, radius=8.0, max_num_nbr=12):
+        
+        max_num_nbr, radius = self.max_num_nbr, self.radius
+        
+        # Read structure using ASE
         atoms = ase_read(cell_file)
+        positions = atoms.get_positions()
+        cell = atoms.get_cell(complete=True)
+        atomic_symbols = atoms.get_chemical_symbols()
         chem_nums = list(atoms.numbers)
         max_atomic_number = max(max(chem_nums), 112)
         one_hot_encodings = []
+
+        nat = len(atoms)
         for atom in atoms:
             encoding = [0] * (max_atomic_number + 1)
             encoding[atom.number] = 1
             one_hot_encodings.append(encoding)
-        one_hot_encodings = np.array(one_hot_encodings, dtype = np.int32)
 
-        fp_mat = self.get_fp_mat(cell_file)
-        fp_mat[np.abs(fp_mat) < 1.0e-10] = 0.0
-        f_mat = fp_mat / np.linalg.norm(fp_mat, axis=-1, keepdims=True)
-        atom_fea = np.hstack((one_hot_encodings, fp_mat))
-        # atom_fea = fp_mat / np.linalg.norm(fp_mat, axis=-1, keepdims=True)
-        # atom_fea = one_hot_encodings
+        atom_fea_arr = np.array(one_hot_encodings, dtype = np.float64)
 
-        # fp_mat = self.get_fp_mat(cell_file)
-        # fp_mat[np.abs(fp_mat) < 1.0e-10] = 0.0
-        # atom_fea = fp_mat / np.linalg.norm(fp_mat, axis=-1, keepdims=True)
+        # Convert ASE structure to Pymatgen Structure
+        pymatgen_structure = Structure(cell, atomic_symbols, positions)
 
-        all_nbrs = crystal.get_all_neighbors(self.radius, include_index=True)
-        all_nbrs = [sorted(nbrs, key=lambda x: x[1]) for nbrs in all_nbrs]
-        nbr_fea_idx, nbr_fea = [], []
-        for nbr in all_nbrs:
-            if len(nbr) < self.max_num_nbr:
+        # Pymatgen unit cell vectors
+        S = pymatgen_structure.lattice.matrix
+
+        # Create ASE NeighborList
+        # Note: (self_interaction=True, bothways=True) will double count center atom
+        nl = NeighborList([radius / 2] * len(atoms), self_interaction=True, bothways=True)
+        nl.update(atoms)
+
+        nbr_idx, nbr_dis, rcov, disp, d = [], [], [], [], []
+
+        # Looping over POSCAR
+        for iat, atom in enumerate(atoms):
+            indices, offsets = nl.get_neighbors(iat)
+            i_center_pos = atoms[iat].position
+            local_nbr_idx, local_nbr_dis, local_rcov, local_disp, local_d = [], [], [], [], []
+            # Looping over neighbor list
+            for j, idx in enumerate(indices):
+                j_nbr_pos = atoms[idx].position
+                local_nbr_idx.append(idx)
+                local_nbr_dis.append(offsets[j].tolist())
+                local_rcov.append(CovalentRadius.radius[atomic_symbols[idx]])
+
+                disp_vec = j_nbr_pos - i_center_pos + np.dot(S, offsets[j])
+                d2 = np.vdot(disp_vec, disp_vec)
+                local_disp.append(disp_vec.tolist())
+                local_d.append(np.sqrt(d2))
+            # Sort neighbors for i_atom from nearest to furtherest
+            combined = list(zip(local_nbr_idx, local_nbr_dis, local_rcov, local_disp, local_d))
+            combined_sorted = sorted(combined, key=lambda x: x[-1])
+            nbr_idx_sorted, nbr_dis_sorted, rcov_sorted, disp_sorted, d_sorted = zip(*combined_sorted)
+
+            nbr_idx.append(list(nbr_idx_sorted))
+            nbr_dis.append(list(nbr_dis_sorted))
+            rcov.append(list(rcov_sorted))
+            disp.append(list(disp_sorted))
+            d.append(list(d_sorted))
+
+        trim_nbr_idx, trim_nbr_dis, trim_rcov, trim_disp, trim_d = [], [], [], [], []
+        for iat in range(nat):
+            n_nbr = len(nbr_idx[iat])
+            if n_nbr < (max_num_nbr + 2):
                 warnings.warn('{} not find enough neighbors to build graph. '
                               'If it happens frequently, consider increase '
-                              'radius.'.format(struct_id))
-                nbr_fea_idx.append(list(map(lambda x: x[2], nbr)) +
-                                   [0] * (self.max_num_nbr - len(nbr)))
-                nbr_fea.append(list(map(lambda x: x[1], nbr)) +
-                               [self.radius + 1.] * (self.max_num_nbr -
-                                                     len(nbr)))
+                              'radius.'.format(cell_file))
+                local_nbr_idx, local_nbr_dis, local_rcov, local_disp, local_d = \
+                nbr_idx[iat], nbr_dis[iat], rcov[iat], disp[iat], d[iat]
+                for i_iter in range(max_num_nbr + 2 - n_nbr):
+                    local_nbr_idx.append(sorted_nbr_idx[iat][-1])
+                    local_nbr_dis.append(sorted_nbr_dis[iat][-1])
+                    local_rcov.append(sorted_rcov[iat][-1])
+                    local_disp.append(sorted_disp[iat][-1])
+                    local_d.append(sorted_d[iat][-1])
             else:
-                nbr_fea_idx.append(list(map(lambda x: x[2],
-                                            nbr[:self.max_num_nbr])))
-                nbr_fea.append(list(map(lambda x: x[1],
-                                        nbr[:self.max_num_nbr])))
-        nbr_fea_idx, nbr_fea = np.array(nbr_fea_idx), np.array(nbr_fea)
-        nbr_fea = self.gdf.expand(nbr_fea)
-        nbr_fea[np.abs(nbr_fea) < 1.0e-10] = 0.0
-        nbr_fea = nbr_fea / np.linalg.norm(nbr_fea, axis=-1, keepdims=True)
+                local_nbr_idx, local_nbr_dis, local_rcov, local_disp, local_d = \
+                nbr_idx[iat][:max_num_nbr+2], nbr_dis[iat][:max_num_nbr+2], \
+                rcov[iat][:max_num_nbr+2], disp[iat][:max_num_nbr+2], d[iat][:max_num_nbr+2]
+
+            trim_nbr_idx.append(local_nbr_idx)
+            trim_nbr_dis.append(local_nbr_dis)
+            trim_rcov.append(local_rcov)
+            trim_disp.append(local_disp)
+            trim_d.append(local_d)
+
+        nbr_idx_arr, nbr_dis_arr, rcov_arr, disp_arr, d_arr = \
+        np.array(trim_nbr_idx), np.array(trim_nbr_dis), np.array(trim_rcov), \
+        np.array(trim_disp), np.array(trim_d)
+        # Do not include center atom for nbr_idx_arr, nbr_idx_arr
+        nbr_idx_arr = nbr_idx_arr[:, 2:]
+        nbr_dis_arr = nbr_dis_arr[:, 2:]
+        # Include center atom for nbr_idx_arr, nbr_idx_arr
+        rcov_arr = rcov_arr[:, 1:]
+        disp_arr = disp_arr[:, 1:]
+        d_arr= d_arr[:, 1:]
+        nbr_fea_arr = get_gom(disp_arr, d_arr, rcov_arr, lmax=1)
+
+        return atom_fea_arr, nbr_fea_arr, nbr_idx_arr
+    
+    
+    @lru_cache(maxsize=None)  # Cache loaded structures
+    def __getitem__(self, idx):
+        
+        struct_id, target = self.id_prop_data[idx]
+        cell_file = os.path.join(self.root_dir, struct_id+'.vasp')
+        assert os.path.isfile(cell_file)
+        
+        # fp_mat = self.get_fp_mat(cell_file)
+        # fp_mat[np.abs(fp_mat) < 1.0e-10] = 0.0
+        # f_mat = fp_mat / np.linalg.norm(fp_mat, axis=-1, keepdims=True)
+        # atom_fea = np.hstack((one_hot_encodings, fp_mat))
+        
+        atom_fea, nbr_fea, nbr_fea_idx = self.get_atom_nbr_feature(cell_file)
+        # nbr_fea[np.abs(nbr_fea) < 1.0e-10] = 0.0
+        # nbr_fea = nbr_fea / np.linalg.norm(nbr_fea, axis=-1, keepdims=True)
         nbr_fea = torch.Tensor(nbr_fea)
         nbr_fea_idx = torch.LongTensor(nbr_fea_idx)
         atom_fea = torch.Tensor(atom_fea)
         target = torch.Tensor([float(target)])
-        '''
-            result = ((atom_fea, nbr_fea, nbr_fea_idx), target, struct_id)
-            self.cache[idx] = result
-        return self.cache[idx]
-        '''
+        
         return (atom_fea, nbr_fea, nbr_fea_idx), target, struct_id
