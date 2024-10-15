@@ -511,7 +511,12 @@ class StructData(Dataset):
     # @lru_cache(maxsize=None)
     def __getitem__(self, idx):
         if self.processed_data is not None:
-            atom_fea, nbr_fea, nbr_fea_idx, target, struct_id = self.processed_data[idx]
+            item = self.processed_data[idx]
+            atom_fea = item['atom_fea']
+            nbr_fea = item['nbr_fea']
+            nbr_fea_idx = item['nbr_fea_idx']
+            target = item['target']
+            struct_id = item['struct_id']
         else:
             struct_id, target = self.id_prop_data[idx]
             cell_file = os.path.join(self.root_dir, struct_id + '.vasp')
@@ -519,10 +524,10 @@ class StructData(Dataset):
             atom_fea, nbr_fea, nbr_fea_idx = self.process_structure(crystal, struct_id)
         
         # Convert numpy arrays to torch tensors
-        atom_fea = torch.Tensor(atom_fea)
-        nbr_fea = torch.Tensor(nbr_fea)
-        nbr_fea_idx = torch.LongTensor(nbr_fea_idx)
-        target = torch.Tensor([float(target)])
+        atom_fea = torch.tensor(atom_fea, dtype=torch.float)
+        nbr_fea = torch.tensor(nbr_fea, dtype=torch.float)
+        nbr_fea_idx = torch.tensor(nbr_fea_idx, dtype=torch.long)
+        target = torch.tensor([float(target)], dtype=torch.float)
         
         return (atom_fea, nbr_fea, nbr_fea_idx), target, struct_id
 
@@ -538,8 +543,12 @@ class StructData(Dataset):
         if self.num_workers > 1:
             # Parallel processing
             with multiprocessing.Pool(processes=self.num_workers) as pool:
-                chunk_size = len(atom_feas) // self.num_workers
-                chunks = [(i, min(i + chunk_size, len(atom_feas))) for i in range(0, len(atom_feas), chunk_size)]
+                total_size = len(atom_feas)
+                chunk_size = -(-total_size // self.num_workers)  # Ceiling division
+                chunks = []
+                for i in range(0, total_size, chunk_size):
+                    end = min(i + chunk_size, total_size)
+                    chunks.append((i, end))
                 
                 process_chunk = partial(self._process_data_chunk, 
                                         atom_feas=atom_feas, 
@@ -568,21 +577,45 @@ class StructData(Dataset):
 
     def save_dataset(self):
         """Processes and saves the dataset to disk as a compressed file."""
-        atom_feas, nbr_feas, nbr_fea_idxs, targets, struct_ids = [], [], [], [], []
+        data = []
         for struct_id, target in self.id_prop_data:
             cell_file = os.path.join(self.root_dir, struct_id + '.vasp')
             crystal = Structure.from_file(cell_file)
             atom_fea, nbr_fea, nbr_fea_idx = self.process_structure(crystal, struct_id)
-            atom_feas.append(atom_fea)
-            nbr_feas.append(nbr_fea)
-            nbr_fea_idxs.append(nbr_fea_idx)
-            targets.append(float(target))
-            struct_ids.append(struct_id)
+            data.append({
+                'atom_fea': atom_fea,
+                'nbr_fea': nbr_fea,
+                'nbr_fea_idx': nbr_fea_idx,
+                'target': float(target),
+                'struct_id': struct_id
+            })
         
-        np.savez_compressed(self.processed_file,
-                            atom_feas=atom_feas,
-                            nbr_feas=nbr_feas,
-                            nbr_fea_idxs=nbr_fea_idxs,
-                            targets=targets,
-                            struct_ids=struct_ids)
+        np.savez_compressed(self.processed_file, data=data)
         print("Dataset saved to disk.")
+
+    def load_processed_dataset(self):
+        """Loads the processed dataset from disk, optionally using parallel processing."""
+        with np.load(self.processed_file, allow_pickle=True) as npz_file:
+            data = npz_file['data']
+
+        if self.num_workers > 1:
+            # Parallel processing
+            with multiprocessing.Pool(processes=self.num_workers) as pool:
+                chunk_size = len(data) // self.num_workers
+                chunks = [(i, min(i + chunk_size, len(data))) for i in range(0, len(data), chunk_size)]
+                
+                process_chunk = partial(self._process_data_chunk, data=data)
+                
+                results = pool.map(process_chunk, chunks)
+                
+            self.processed_data = [item for sublist in results for item in sublist]
+        else:
+            # Single-threaded processing
+            self.processed_data = list(data)
+
+        # print(f"Loaded {len(self.processed_data)} data points from {self.processed_file}")
+
+    @staticmethod
+    def _process_data_chunk(chunk_indices, data):
+        start, end = chunk_indices
+        return list(data[start:end])
