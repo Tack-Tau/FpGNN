@@ -15,7 +15,7 @@
 - Introduce `IdTargetData` class to do efficient sampling on the dataset
 - Update `collate_pool` to handle both `IdTargetData` and `IdTargetData` type dataset
 - Switching from [Python3 implementation](https://github.com/Tack-Tau/fplib3/) of the Fingerprint Library to [C implementation](https://github.com/Tack-Tau/fplib) to improve speed. \
-  (Optional) Modify the `setup.py` in `fplib`:
+  (Optional) Modify the `setup.py` in `fplib` if you use `conda` to install LAPACK:
   ```python
   lapack_dir=["$CONDA_PREFIX/lib"]
   lapack_lib=['openblas']
@@ -25,15 +25,29 @@
   .
   include_dirs = [source_dir, "$CONDA_PREFIX/include"]
   ```
-  Also set the corresponding `DYLD_LIBRARY_PATH` in your `.bashrc` file as:
-  ```bash
-  export DYLD_LIBRARY_PATH="$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH"
+  if you use `brew` to install LAPACK:
+  ```python
+  lapack_dir=["$HOMEBREW_PREFIX/opt/openblas/lib"]
+  lapack_lib=['openblas']
+  extra_link_args = ['-framework', 'Accelerate',
+                     "-Wl,-rpath,$HOMEBREW_PREFIX/opt/openblas/lib"]
+  .
+  .
+  .
+  include_dirs = [source_dir, "$HOMEBREW_PREFIX/opt/openblas/include"]
   ```
-  Then install LAPACK using `conda`:
+  you probaly need to modify your `~/.bashrc` file for compiler to find the correct LAPACK library:
+  ```bash
+  # If you use `conda install conda-forge::lapack`
+  export DYLD_LIBRARY_PATH="$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH"
+  # If you use `brew install openblas`
+  export CFLAGS="-I/opt/homebrew/opt/openblas/include $CFLAGS"
+  export LDFLAGS="-L/opt/homebrew/opt/openblas/lib $LDFLAGS"
+  ```
+  Then install the Fingerprint library (3.1.2 snapshot):
   ```bash
   conda create -n fplibenv python=3.10 pip ; conda activate fplibenv
   python3 -m pip install -U pip setuptools wheel
-  conda install conda-forge::lapack
   git clone https://github.com/Tack-Tau/fplib.git
   cd fplib ; git checkout fplib_3.1.2
   python3 -m pip install .
