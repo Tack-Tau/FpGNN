@@ -14,7 +14,7 @@ from sklearn import metrics
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
 
-from fpcnn.data import StructData
+from fpcnn.data import StructData, IdTargetData
 from fpcnn.data import collate_pool
 from fpcnn.model import CrystalGraphConvNet
 
@@ -27,6 +27,8 @@ parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                     help='number of data loading workers (default: 0)')
 parser.add_argument('--disable-cuda', action='store_true',
                     help='Disable CUDA')
+parser.add_argument('--disable-mps', action='store_true',
+                    help='Disable MPS')
 parser.add_argument('--print-freq', '-p', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 
@@ -41,7 +43,7 @@ else:
     print("=> no model params found at '{}'".format(args.modelpath))
 
 args.cuda = not args.disable_cuda and torch.cuda.is_available()
-args.mps = torch.backends.mps.is_available() and torch.backends.mps.is_built()
+args.mps = not args.disable_mps and torch.backends.mps.is_available() and torch.backends.mps.is_built()
 
 if model_args.task == 'regression':
     best_mae_error = 1e10
@@ -53,7 +55,17 @@ def main():
     global args, model_args, best_mae_error
 
     # load data
-    dataset = StructData(args.structpath)
+    id_target_data = IdTargetData(root_dir=args.structpath)
+    dataset = StructData(id_prop_data=id_target_data,
+                         root_dir=args.structpath,
+                         max_num_nbr=model_args.max_num_nbr,
+                         radius=model_args.radius,
+                         dmin=model_args.dmin,
+                         step=model_args.step,
+                         var=model_args.var,
+                         nx=model_args.nx,
+                         lmax=model_args.lmax,
+                         save_to_disk=False)
     collate_fn = collate_pool
     test_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                              num_workers=args.workers, collate_fn=collate_fn,
@@ -85,15 +97,6 @@ def main():
         criterion = nn.NLLLoss()
     else:
         criterion = nn.MSELoss()
-    # if args.optim == 'SGD':
-    #     optimizer = optim.SGD(model.parameters(), args.lr,
-    #                           momentum=args.momentum,
-    #                           weight_decay=args.weight_decay)
-    # elif args.optim == 'Adam':
-    #     optimizer = optim.Adam(model.parameters(), args.lr,
-    #                            weight_decay=args.weight_decay)
-    # else:
-    #     raise NameError('Only SGD or Adam is allowed as --optim')
 
     normalizer = Normalizer(torch.zeros(3))
 

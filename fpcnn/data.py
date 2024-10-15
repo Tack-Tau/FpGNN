@@ -463,7 +463,7 @@ class StructData(Dataset):
     def process_structure(self, crystal, struct_id):
         """Processes a single structure and returns its features."""
         # One-hot encoding
-        atoms = crystal.ase_atoms
+        atoms = crystal.to_ase_atoms()
         chem_nums = list(atoms.numbers)
         max_atomic_number = max(max(chem_nums), 112)
         one_hot_encodings = []
