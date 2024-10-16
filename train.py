@@ -166,7 +166,7 @@ def main():
         train_size=args.train_size,
         val_size=args.val_size,
         test_size=args.test_size,
-        multiprocessing_context=None if args.workers == 0 else get_context('fork'),
+        multiprocessing_context=get_context('spawn') if args.workers > 0 else None,
         return_test=True)
 
     # obtain target value normalizer
@@ -630,6 +630,7 @@ def adjust_learning_rate(optimizer, epoch, k):
 
 
 if __name__ == '__main__':
+    os.system('ulimit -n 4096')
     set_sharing_strategy('file_system')
     warnings.filterwarnings("ignore", category=UserWarning, message=".*epoch parameter in `scheduler.step\(\)`.*")
     
