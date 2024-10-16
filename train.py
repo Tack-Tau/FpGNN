@@ -176,7 +176,7 @@ def main():
 
     # obtain target value normalizer
     if args.task == 'classification':
-        normalizer = Normalizer(torch.zeros(2))
+        normalizer = Normalizer(0.0)
         normalizer.load_state_dict({'mean': 0., 'std': 1.})
     else:
         if len(id_target_dataset) < 1000:
@@ -540,14 +540,22 @@ class Normalizer(object):
 
     def __init__(self, tensor):
         """tensor is taken as a sample to calculate the mean and std"""
-        self.mean = torch.mean(tensor)
-        self.std = torch.std(tensor)
+        if isinstance(tensor, torch.Tensor):
+            self.mean = torch.mean(tensor)
+            self.std = torch.std(tensor)
+        else:
+            self.mean = tensor
+            self.std = 1.0
 
     def norm(self, tensor):
-        return (tensor - self.mean) / self.std
+        if isinstance(self.mean, torch.Tensor):
+            return (tensor - self.mean) / self.std
+        return tensor
 
     def denorm(self, normed_tensor):
-        return normed_tensor * self.std + self.mean
+        if isinstance(self.mean, torch.Tensor):
+            return normed_tensor * self.std + self.mean
+        return normed_tensor
 
     def state_dict(self):
         return {'mean': self.mean,
@@ -558,8 +566,9 @@ class Normalizer(object):
         self.std = state_dict['std']
     
     def to(self, device):
-        self.mean = self.mean.to(device)
-        self.std = self.std.to(device)
+        if isinstance(self.mean, torch.Tensor):
+            self.mean = self.mean.to(device)
+            self.std = self.std.to(device)
         return self
 
 def mae(prediction, target):
