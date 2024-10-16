@@ -70,6 +70,9 @@ parser.add_argument('--warmup-epochs', default=10, type=int, metavar='N',
 parser.add_argument('-b', '--batch-size', default=64, type=int,
                     metavar='N',
                     help='mini-batch size (default: 64)')
+parser.add_argument('--drop-last', action='store_true',
+                    help='Drop the last incomplete batch if the dataset '
+                    'size is not divisible by the batch size')
 parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
                     metavar='LR',
                     help='initial learning rate (default: 0.01)')
@@ -150,7 +153,8 @@ def main():
                                 var=args.var,
                                 nx=args.nx,
                                 lmax=args.lmax,
-                                num_workers=args.workers,
+                                batch_size=args.batch_size,
+                                drop_last=args.drop_last,
                                 save_to_disk=args.save_to_disk)
     collate_fn = collate_pool
     class_weights, train_loader, val_loader, test_loader = get_train_val_test_loader(
@@ -166,6 +170,7 @@ def main():
         train_size=args.train_size,
         val_size=args.val_size,
         test_size=args.test_size,
+        drop_last=args.drop_last,
         multiprocessing_context=get_context('spawn') if args.workers > 0 else None,
         return_test=True)
 

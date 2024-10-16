@@ -13,22 +13,19 @@ from functools import reduce, lru_cache
 import numpy as np
 import fplib
 from pymatgen.core.structure import Structure
-# from pymatgen.io.ase import AseAtomsAdaptor
 from ase.io import read as ase_read
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.sampler import SubsetRandomSampler, WeightedRandomSampler
-from torch.multiprocessing import Pool
 from sklearn.utils.class_weight import compute_class_weight
-from functools import partial
 
 def get_train_val_test_loader(dataset, classification=False,
                               collate_fn=default_collate,
                               batch_size=64, train_ratio=None,
                               val_ratio=0.1, test_ratio=0.1,
                               return_test=False, num_workers=1,
-                              pin_memory=False, persistent_workers=False,
+                              pin_memory=False, persistent_workers=True,
                               multiprocessing_context=None,
                               shuffle=False, drop_last=True,
                               **kwargs):
@@ -113,30 +110,30 @@ def get_train_val_test_loader(dataset, classification=False,
         test_sampler = SubsetRandomSampler(indices[-test_size:])
     train_loader = DataLoader(dataset, batch_size=batch_size,
                               sampler=train_sampler,
-                              num_workers=num_workers,
+                              num_workers=max(0, num_workers),
                               collate_fn=collate_fn,
                               shuffle=shuffle,
                               drop_last=drop_last,
-                              persistent_workers=persistent_workers,
+                              persistent_workers=persistent_workers and num_workers > 0,
                               multiprocessing_context=multiprocessing_context,
                               pin_memory=pin_memory)
     val_loader = DataLoader(dataset, batch_size=batch_size,
                             sampler=val_sampler,
-                            num_workers=num_workers,
+                            num_workers=max(0, num_workers),
                             collate_fn=collate_fn,
                             shuffle=shuffle,
                             drop_last=drop_last,
-                            persistent_workers=persistent_workers,
+                            persistent_workers=persistent_workers and num_workers > 0,
                             multiprocessing_context=multiprocessing_context,
                             pin_memory=pin_memory)
     if return_test:
         test_loader = DataLoader(dataset, batch_size=batch_size,
                                  sampler=test_sampler,
-                                 num_workers=num_workers,
+                                 num_workers=max(0, num_workers),
                                  collate_fn=collate_fn,
                                  shuffle=shuffle,
                                  drop_last=drop_last,
-                                 persistent_workers=persistent_workers,
+                                 persistent_workers=persistent_workers and num_workers > 0,
                                  multiprocessing_context=multiprocessing_context,
                                  pin_memory=pin_memory)
     if classification:
@@ -363,7 +360,8 @@ class StructData(Dataset):
                  var=1.0,
                  nx=256,
                  lmax=0,
-                 num_workers=1,
+                 batch_size=64,
+                 drop_last=False,
                  save_to_disk=False):
         self.root_dir = root_dir
         self.id_prop_data = id_prop_data
@@ -373,7 +371,9 @@ class StructData(Dataset):
         self.save_to_disk = save_to_disk
         assert lmax == 0, 'p-orbitals is not supported at this time!'
         assert nx >= comb(max_num_nbr, 2), 'nx is too small for the given max_num_nbr!'
-        self.num_workers = num_workers + 1
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.total_size = len(self.id_prop_data)
         
         self.gdf = GaussianDistance(dmin=dmin, dmax=self.radius, step=step, var=var)
         
@@ -383,7 +383,7 @@ class StructData(Dataset):
             self.save_dataset()
         
         if os.path.exists(self.processed_file):
-            self.load_processed_dataset()
+            self.load_dataset()
         else:
             self.processed_data = None
 
@@ -506,77 +506,66 @@ class StructData(Dataset):
 
         return atom_fea, nbr_fea, nbr_fea_idx
     
-    @lru_cache(maxsize=None)
+    # @lru_cache(maxsize=None)
     def __getitem__(self, idx):
         if self.processed_data is not None:
             item = self.processed_data[idx]
-            if isinstance(item, dict):
-                atom_fea = item['atom_fea']
-                nbr_fea = item['nbr_fea']
-                nbr_fea_idx = item['nbr_fea_idx']
-                target = item['target']
-                struct_id = item['struct_id']
-            elif isinstance(item, tuple):
-                atom_fea, nbr_fea, nbr_fea_idx, target, struct_id = item
-            else:
-                raise TypeError(f"Unexpected data type: {type(item)}")
         else:
-            struct_id, target = self.id_prop_data[idx]
-            cell_file = os.path.join(self.root_dir, struct_id + '.vasp')
-            crystal = Structure.from_file(cell_file)
-            atom_fea, nbr_fea, nbr_fea_idx = self.process_structure(crystal, struct_id)
+            item = self.process_item(idx)
         
-        # Convert numpy arrays to torch tensors
-        atom_fea = torch.Tensor(atom_fea)
-        nbr_fea = torch.Tensor(nbr_fea)
-        nbr_fea_idx = torch.LongTensor(nbr_fea_idx)
-        target = torch.Tensor([float(target)])
+        atom_fea = torch.Tensor(item['atom_fea'])
+        nbr_fea = torch.Tensor(item['nbr_fea'])
+        nbr_fea_idx = torch.LongTensor(item['nbr_fea_idx'])
+        target = torch.Tensor([item['target']])
         
-        return (atom_fea, nbr_fea, nbr_fea_idx), target, struct_id
+        return (atom_fea, nbr_fea, nbr_fea_idx), target, item['struct_id']
 
-    def load_processed_dataset(self):
-        """Loads the processed dataset from disk, optionally using parallel processing."""
-        with np.load(self.processed_file, allow_pickle=True) as npz_file:
-            data = npz_file['data']
+    def process_item(self, idx):
+        struct_id, target = self.id_prop_data[idx]
+        cell_file = os.path.join(self.root_dir, struct_id + '.vasp')
+        crystal = Structure.from_file(cell_file)
+        atom_fea, nbr_fea, nbr_fea_idx = self.process_structure(crystal, struct_id)
+        return {
+            'atom_fea': atom_fea,
+            'nbr_fea': nbr_fea,
+            'nbr_fea_idx': nbr_fea_idx,
+            'target': float(target),
+            'struct_id': struct_id
+        }
 
-        if self.num_workers > 1:
-            # Parallel processing
-            with Pool(processes=self.num_workers) as pool:
-                total_size = len(data)
-                chunk_size = -(-total_size // self.num_workers)  # Ceiling division
-                chunks = []
-                for i in range(0, total_size, chunk_size):
-                    end = min(i + chunk_size, total_size)
-                    chunks.append((i, end))
-                
-                results = pool.map(partial(self._process_data_chunk, data=data), chunks)
-                
-            self.processed_data = [item for sublist in results for item in sublist]
-        else:
-            # Single-threaded processing
-            self.processed_data = list(data)
-
-        # print(f"Loaded {len(self.processed_data)} data points from {self.processed_file}")
-
-    @staticmethod
-    def _process_data_chunk(chunk_indices, data):
-        start, end = chunk_indices
-        return list(data[start:end])
+    def load_dataset(self):
+        print(f"Loading dataset from {self.processed_file}")
+        with np.load(self.processed_file, allow_pickle=True) as loader:
+            self.processed_data = loader['data']
+        print(f"Loaded {len(self.processed_data)} data points")
 
     def save_dataset(self):
-        """Processes and saves the dataset to disk as a compressed file."""
+        print("Processing and saving dataset...")
         data = []
-        for struct_id, target in self.id_prop_data:
-            cell_file = os.path.join(self.root_dir, struct_id + '.vasp')
-            crystal = Structure.from_file(cell_file)
-            atom_fea, nbr_fea, nbr_fea_idx = self.process_structure(crystal, struct_id)
-            data.append({
-                'atom_fea': atom_fea,
-                'nbr_fea': nbr_fea,
-                'nbr_fea_idx': nbr_fea_idx,
-                'target': float(target),
-                'struct_id': struct_id
-            })
+        for i in range(0, self.total_size, self.batch_size):
+            end_index = min(i + self.batch_size, self.total_size)
+            
+            if self.drop_last and end_index - i < self.batch_size:
+                break
+            
+            batch = [self.process_item(j) for j in range(i, end_index)]
+            data.extend(batch)
         
         np.savez_compressed(self.processed_file, data=data)
         print("Dataset saved to disk.")
+
+    def __iter__(self):
+        self.current_index = 0
+        return self
+
+    def __next__(self):
+        if self.current_index >= self.total_size:
+            raise StopIteration
+        end_index = min(self.current_index + self.batch_size, self.total_size)
+        
+        if self.drop_last and end_index - self.current_index < self.batch_size:
+            raise StopIteration
+        
+        batch = [self.process_item(i) for i in range(self.current_index, end_index)]
+        self.current_index = end_index
+        return batch
